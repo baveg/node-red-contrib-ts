@@ -30,13 +30,25 @@ interface Compilation {
 const getTimeouts = (n: any) => n.timeoutTimers || (n.timeoutTimers = []);
 const getIntervals = (n: any) => n.intervalTimers || (n.intervalTimers = []);
 
+function getScriptTarget(): ts.ScriptTarget {
+    const major = parseInt(process.version.slice(1).split('.')[0], 10);
+    if (major >= 22) return ts.ScriptTarget.ES2024;
+    if (major >= 20) return ts.ScriptTarget.ES2023;
+    if (major >= 18) return ts.ScriptTarget.ES2022;
+    if (major >= 16) return ts.ScriptTarget.ES2021;
+    if (major >= 14) return ts.ScriptTarget.ES2020;
+    return ts.ScriptTarget.ES2019;
+}
+
+const SCRIPT_TARGET = getScriptTarget();
+
 function compileTypeScript(node: Node, script: string): string {
     try {
         node.log(`Compiling TypeScript (${script.length} chars)`);
         
         const result = ts.transpileModule(script, {
             compilerOptions: {
-                target: ts.ScriptTarget.ES2020,
+                target: SCRIPT_TARGET,
                 module: ts.ModuleKind.CommonJS,
                 moduleResolution: ts.ModuleResolutionKind.NodeJs,
                 
