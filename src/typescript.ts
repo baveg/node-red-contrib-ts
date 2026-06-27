@@ -22,7 +22,7 @@ type Msg = {
 interface Compilation {
     updated: number;
     ready: Promise<void>;
-    fun: (msg: Msg) => Promise<Msg|Msg[]>;
+    fun: (msg: Msg, send: (msg: Msg|Msg[]) => void, done: (err?: any) => void) => Promise<Msg|Msg[]>;
     ini: () => Promise<void>;
     fin: () => Promise<void>;
 }
@@ -153,6 +153,8 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
     const nodeContext = node.context();
     const ctx: any = {
         msg: {},
+        done: () => {},
+        send: () => {},
         node,
         RED,
         __global: global,
@@ -219,8 +221,10 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
         const ini = new Function(...funArgs, `return ${iniJs}`);
         const fin = new Function(...funArgs, `return ${finJs}`);
 
-        comp.fun = async (msg) => {
+        comp.fun = async (msg, send, done) => {
             ctx.msg = msg;
+            ctx.send = send;
+            ctx.done = done;
             return fun(...funArgs.map(k => ctx[k]));
         }
         comp.ini = () => ini(...funArgs.map(k => ctx[k]));
@@ -233,8 +237,10 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
             displayErrors: true
         };
         
-        comp.fun = (msg) => {
+        comp.fun = (msg, send, done) => {
             vmCtx.msg = msg;
+            vmCtx.send = send;
+            vmCtx.done = done;
             return vm.runInContext(funJs, vmCtx, vmOptions);
         };
         comp.ini = () => vm.runInContext(iniJs, vmCtx, vmOptions);
@@ -288,15 +294,21 @@ export = (RED: NodeAPI) => {
         // Precompile on node creation
         getCompilation(this, def, RED);
         
-        this.on('input', async (msg: any) => {
+        this.on('input', async (msg: any, send: any, done: (err?: any) => void) => {
             const comp = await getCompilation(this, def, RED);
-            if (!comp) return;
+            if (!comp) { done(); return; }
+
+            let doneCalled = false;
+            const safeDone = (err?: any) => {
+                if (!doneCalled) { doneCalled = true; done(err); }
+            };
 
             try {
-                const outputs = await comp.fun(msg);
-                this.send(outputs);
+                const outputs = await comp.fun(msg, send, safeDone);
+                send(outputs);
+                safeDone();
             } catch (error: any) {
-                this.error('Error in function execution: ' + (error.stack || error.message));
+                safeDone(error);
             }
         });
         
