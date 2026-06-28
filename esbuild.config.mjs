@@ -1,6 +1,8 @@
 import { build } from 'esbuild';
 import { copyFile, cp, readFile, rm, writeFile } from 'node:fs/promises';
 
+const pkg = JSON.parse(await readFile('./package.json', 'utf8'));
+
 const config = {
   bundle: true,
   platform: 'node',
@@ -13,7 +15,11 @@ const config = {
   treeShaking: true,
   // drop: ['console', 'debugger'],
   legalComments: 'none',
-  keepNames: false
+  keepNames: false,
+  define: {
+    __PKG_VERSION__: JSON.stringify(pkg.version),
+    __BUILD_DATE__: JSON.stringify(new Date().toISOString()),
+  },
 };
 
 const serverConfig = {

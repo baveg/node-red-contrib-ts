@@ -1,7 +1,6 @@
-import { NodeAPI, Node, NodeDef, NodeAPISettingsWithData } from 'node-red';
+import { NodeAPI, Node, NodeDef } from 'node-red';
 import * as vm from 'vm';
 import ts from 'typescript';
-import util from 'util';
 
 interface TypeScriptNodeDef extends NodeDef {
     name: string;
@@ -30,37 +29,53 @@ interface Compilation {
     fin: () => Promise<void>;
 }
 
+declare const __PKG_VERSION__: string;
+declare const __BUILD_DATE__: string;
+
 class NodeWrapper {
     constructor(
-        private _n: any,
-        private _s: SendFun,
-        private _d: DoneFun,
-        private _m: any,
+        private _node: TsNode,
+        private _send: SendFun,
+        private _done: DoneFun,
+        private _msgid: string,
     ) {}
 
-    get id() { return this._n.id; }
-    get name() { return this._n.name; }
-    get path() { return this._n._path; }
-    get outputCount() { return this._n.outputs; }
+    get id() { return this._node.id; }
+    get name() { return this._node.name; }
+    get path() { return this._node._path; }
+    get outputCount() { return this._node.def.outputs; }
+    get packageVersion() { return __PKG_VERSION__; }
+    get buildDate() { return __BUILD_DATE__; }
 
-    log(...args: any[]) { return this._n.log(...args); }
-    warn(...args: any[]) { return this._n.warn(...args); }
-    error(...args: any[]) { return this._n.error(...args); }
-    debug(...args: any[]) { return this._n.debug(...args); }
-    trace(...args: any[]) { return this._n.trace(...args); }
+    log(...args: any[]) { return this._node.log(...args); }
+    warn(...args: any[]) { return this._node.warn(...args); }
+    error(...args: any[]) { return this._node.error(...args); }
+    debug(...args: any[]) { return this._node.debug(...args); }
+    trace(...args: any[]) { return this._node.trace(...args); }
     status(...args: any[]) {
-        this._n.clearStatus = true;
-        return this._n.status(...args);
+        this._node.clearStatus = true;
+        return this._node.status(...args);
     }
 
-    on(...args: any[]) { return this._n.on(...args); }
+    on(...args: any[]) { return (this._node as any).on(...args); }
 
     send(msg: Msg | Msg[]) {
-        sendResults(this._s, this._m._msgid, msg);
+        sendResults(this._send, this._msgid, msg);
     }
 
     done(err?: any) {
-        this._d(err);
+        this._done(err);
+    }
+
+    toJSON() {
+        return {
+            id: this.id,
+            name: this.name,
+            path: this.path,
+            outputCount: this.outputCount,
+            packageVersion: this.packageVersion,
+            buildDate: this.buildDate,
+        }
     }
 }
 
@@ -211,19 +226,24 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
     
     const nodeContext = node.context();
     const nodeSend = (...args: any[]) => node.send(...args);
+
+    const withError = (cb: Function) => {
+        try {
+            const res = cb();
+            if (typeof res?.catch === 'function') {
+                res.catch(err => node.error(err, {}));
+            }
+        } catch(err) {
+            node.error(err, {});
+        }
+    }
+
     const scope: any = {
         msg: {},
-        node: new NodeWrapper(node, nodeSend, () => {}, {}),
+        node: new NodeWrapper(node, nodeSend, () => {}, ''),
         RED,
         __global: global,
-        console,
-        util,
-        Buffer: Buffer,
-        URL: URL,
-        URLSearchParams: URLSearchParams,
-        Date: Date,
         require,
-        fetch,
         context: nodeContext,
         flow: nodeContext.flow,
         global: nodeContext.global,
@@ -232,12 +252,8 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
         },
         setTimeout: (handler: Function, delayMs?: number) => {
             const ref = setTimeout(() => {
-                scope.clearTimeout(ref);
-                try {
-                    handler();
-                } catch(err) {
-                    node.error(err, {});
-                }
+                node.timeouts.delete(ref);
+                withError(handler);
             }, delayMs);
             node.timeouts.add(ref);
             return ref;
@@ -248,11 +264,7 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
         },
         setInterval: (handler: Function, delayMs?: number) => {
             const ref = setInterval(() => {
-                try {
-                    handler();
-                } catch(err) {
-                    node.error(err,{});
-                }
+                withError(handler);
             }, delayMs);
             node.intervals.add(ref);
             return ref;
@@ -275,14 +287,21 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
 
         comp.fun = async (msg, send, done) => {
             scope.msg = msg;
-            scope.node = new NodeWrapper(node, send, done, msg);
+            scope.node = new NodeWrapper(node, send, done, msg._msgid);
             return fun(...funArgs.map(k => scope[k]));
         }
         comp.ini = () => ini(...funArgs.map(k => scope[k]));
         comp.fin = () => fin(...funArgs.map(k => scope[k]));
     }
     else {
-        const vmCtx = vm.createContext(scope);
+        const vmCtx = vm.createContext({
+            ...scope,
+            console,
+            Buffer,
+            URL,
+            URLSearchParams,
+            fetch,
+        });
         const vmOptions: vm.RunningScriptOptions = {
             timeout,
             displayErrors: true
@@ -293,7 +312,7 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
 
         comp.fun = (msg, send, done) => {
             vmCtx._msg = msg;
-            vmCtx._node = new NodeWrapper(node, send, done, msg);
+            vmCtx._node = new NodeWrapper(node, send, done, msg._msgid);
             return funScript.runInContext(vmCtx, vmOptions);
         };
         comp.ini = () => iniScript.runInContext(vmCtx, vmOptions);
@@ -340,6 +359,16 @@ interface TsNode extends Node {
     comp: Compilation | undefined;
     timeouts: Set<any>;
     intervals: Set<any>;
+    def: TypeScriptNodeDef;
+    _path: string;
+    clearStatus: boolean;
+
+    log(...args: any[]): void;
+    warn(...args: any[]): void;
+    error(...args: any[]): void;
+    debug(...args: any[]): void;
+    trace(...args: any[]): void;
+    status(...args: any[]): void;
 }
 
 export = (RED: NodeAPI) => {
@@ -351,6 +380,7 @@ export = (RED: NodeAPI) => {
 
         this.timeouts = new Set<any>();
         this.intervals = new Set<any>();
+        this.def = def;
         
         this.on('input', async (msg: any, send: any, done: (err?: any) => void) => {
             const comp = await getCompilation(this, def, RED);
