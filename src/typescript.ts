@@ -50,7 +50,7 @@ function compileTypeScript(node: Node, script: string): string {
             compilerOptions: {
                 target: SCRIPT_TARGET,
                 module: ts.ModuleKind.CommonJS,
-                moduleResolution: ts.ModuleResolutionKind.NodeJs,
+                moduleResolution: ts.ModuleResolutionKind.Node10,
                 
                 // Maximum permissiveness - allow everything
                 allowJs: true,
@@ -158,16 +158,31 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
     const finTs = def.finalize || '';
     const timeout = Number(def.timeout) || undefined;
     
-    const funJs = compileTypeScript(node, `(async function() { ${funTs} })()`);
+    const funJs = compileTypeScript(node, `(async function(msg, node) { ${funTs} })(msg, node)`);
     const iniJs = compileTypeScript(node, `(async function() { ${iniTs} })()`);
     const finJs = compileTypeScript(node, `(async function() { ${finTs} })()`);
     
     const nodeContext = node.context();
+    const n = node as any;
+    const nodeWrapper: any = {
+        id: node.id,
+        name: node.name,
+        outputCount: n.outputCount,
+        log: node.log.bind(node),
+        warn: node.warn.bind(node),
+        error: node.error.bind(node),
+        debug: node.debug.bind(node),
+        trace: node.trace.bind(node),
+        status: n.status.bind(node),
+        on: n.on.bind(node),
+        send: () => {},
+        done: () => {},
+    };
     const ctx: any = {
         msg: {},
-        done: () => {},
-        send: () => {},
-        node,
+        node: nodeWrapper,
+    };
+    Object.assign(ctx, {
         RED,
         __global: global,
         console,
@@ -221,7 +236,7 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
                 getIntervals(node).splice(index, 1);
             }
         },
-    };
+    });
 
     // Inject modules (including default ones defined in HTML)
     await injectModules(ctx, libs, RED, node);
@@ -234,29 +249,29 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
         const fin = new Function(...funArgs, `return ${finJs}`);
 
         comp.fun = async (msg, send, done) => {
-            ctx.msg = msg;
-            ctx.send = send;
-            ctx.done = done;
-            return fun(...funArgs.map(k => ctx[k]));
+            const callCtx = { ...ctx, msg, node: { ...nodeWrapper, send, done } };
+            return fun(...funArgs.map(k => callCtx[k]));
         }
         comp.ini = () => ini(...funArgs.map(k => ctx[k]));
         comp.fin = () => fin(...funArgs.map(k => ctx[k]));
     }
     else {
         const vmCtx = vm.createContext(ctx);
-        const vmOptions: vm.RunningCodeOptions = {
+        const vmOptions: vm.RunningScriptOptions = {
             timeout,
             displayErrors: true
         };
-        
+        const funScript = new vm.Script(funJs);
+        const iniScript = new vm.Script(iniJs);
+        const finScript = new vm.Script(finJs);
+
         comp.fun = (msg, send, done) => {
             vmCtx.msg = msg;
-            vmCtx.send = send;
-            vmCtx.done = done;
-            return vm.runInContext(funJs, vmCtx, vmOptions);
+            vmCtx.node = { ...nodeWrapper, send, done };
+            return funScript.runInContext(vmCtx, vmOptions);
         };
-        comp.ini = () => vm.runInContext(iniJs, vmCtx, vmOptions);
-        comp.fin = () => vm.runInContext(finJs, vmCtx, vmOptions);
+        comp.ini = () => iniScript.runInContext(vmCtx, vmOptions);
+        comp.fin = () => finScript.runInContext(vmCtx, vmOptions);
     }
 
     try {
@@ -344,5 +359,5 @@ export = (RED: NodeAPI) => {
         });
     };
     
-    RED.nodes.registerType("typescript", TypeScriptNode);
+    (RED.nodes.registerType as any)("typescript", TypeScriptNode, { dynamicModuleList: "libs" });
 };
