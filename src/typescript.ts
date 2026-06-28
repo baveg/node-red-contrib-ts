@@ -1,4 +1,4 @@
-import { NodeAPI, Node, NodeDef } from 'node-red';
+import { NodeAPI, Node, NodeDef, NodeAPISettingsWithData } from 'node-red';
 import * as vm from 'vm';
 import ts from 'typescript';
 import util from 'util';
@@ -19,18 +19,65 @@ type Msg = {
     [name: string]: any
 }
 
+type SendFun = (msg: Msg|Msg[]) => void;
+type DoneFun = (err?: any) => void;
+
 interface Compilation {
     updated: number;
     ready: Promise<void>;
-    fun: (msg: Msg, send: (msg: Msg|Msg[]) => void, done: (err?: any) => void) => Promise<Msg|Msg[]>;
+    fun: (msg: Msg, send: SendFun, done: DoneFun) => Promise<Msg|Msg[]>;
     ini: () => Promise<void>;
     fin: () => Promise<void>;
 }
 
-const getTimeouts = (n: any) => n.timeoutTimers || (n.timeoutTimers = []);
-const getIntervals = (n: any) => n.intervalTimers || (n.intervalTimers = []);
+class NodeWrapper {
+    constructor(
+        private _n: any,
+        private _s: SendFun,
+        private _d: DoneFun,
+        private _m: any,
+    ) {}
 
-function getScriptTarget(): ts.ScriptTarget {
+    get id() { return this._n.id; }
+    get name() { return this._n.name; }
+    get path() { return this._n._path; }
+    get outputCount() { return this._n.outputs; }
+
+    log(...args: any[]) { return this._n.log(...args); }
+    warn(...args: any[]) { return this._n.warn(...args); }
+    error(...args: any[]) { return this._n.error(...args); }
+    debug(...args: any[]) { return this._n.debug(...args); }
+    trace(...args: any[]) { return this._n.trace(...args); }
+    status(...args: any[]) {
+        this._n.clearStatus = true;
+        return this._n.status(...args);
+    }
+
+    on(...args: any[]) { return this._n.on(...args); }
+
+    send(msg: Msg | Msg[]) {
+        sendResults(this._s, this._m._msgid, msg);
+    }
+
+    done(err?: any) {
+        this._d(err);
+    }
+}
+
+const sendResults = (send: SendFun, msgid: string, msgs: any) => {
+    if (msgs == null) return;
+    if (!Array.isArray(msgs)) msgs = [msgs];
+    for (const output of msgs) {
+        if (!output) continue;
+        const arr = Array.isArray(output) ? output : [output];
+        for (const m of arr) {
+            if (m && typeof m === 'object' && !Buffer.isBuffer(m)) m._msgid = msgid;
+        }
+    }
+    send(msgs);
+}
+
+const getScriptTarget = (): ts.ScriptTarget => {
     const major = parseInt(process.version.slice(1).split('.')[0], 10);
     if (major >= 22) return ts.ScriptTarget.ES2024;
     if (major >= 20) return ts.ScriptTarget.ES2023;
@@ -125,21 +172,21 @@ function compileTypeScript(node: Node, script: string): string {
     }
 }
 
-async function injectModules(context: any, libs: any[], RED: any, node: Node): Promise<void> {
+async function injectModules(scope: any, libs: any[], RED: any, node: Node): Promise<void> {
     if (!libs || libs.length === 0) return;
     
     const moduleLoadPromises = libs.map(async (lib) => {
         const vname = lib.var;
         if (!vname || vname === '') return;
         
-        if (context.hasOwnProperty(vname) || vname === 'node') {
+        if (scope.hasOwnProperty(vname) || vname === 'node') {
             throw new Error(`Module variable name '${vname}' is reserved or already exists`);
         }
         
         try {
             // Use RED.import() as in the original code
             const loadedModule = await RED.import(lib.module);
-            context[vname] = loadedModule.default || loadedModule;
+            scope[vname] = loadedModule.default || loadedModule;
         } catch (err: any) {
             node.error(`Failed to load module '${lib.module}': ${err.message}`);
             throw err;
@@ -156,33 +203,17 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
     const funTs = def.func || '';
     const iniTs = def.initialize || '';
     const finTs = def.finalize || '';
-    const timeout = Number(def.timeout) || undefined;
+    const timeout = Number(def.timeout) || (RED as any).settings?.globalFunctionTimeout || undefined;
     
     const funJs = compileTypeScript(node, `(async function(msg, node) { ${funTs} })(msg, node)`);
     const iniJs = compileTypeScript(node, `(async function() { ${iniTs} })()`);
     const finJs = compileTypeScript(node, `(async function() { ${finTs} })()`);
     
     const nodeContext = node.context();
-    const n = node as any;
-    const nodeWrapper: any = {
-        id: node.id,
-        name: node.name,
-        outputCount: n.outputCount,
-        log: node.log.bind(node),
-        warn: node.warn.bind(node),
-        error: node.error.bind(node),
-        debug: node.debug.bind(node),
-        trace: node.trace.bind(node),
-        status: n.status.bind(node),
-        on: n.on.bind(node),
-        send: () => {},
-        done: () => {},
-    };
-    const ctx: any = {
+    const nodeSend = (...args: any[]) => node.send(...args);
+    const scope: any = {
         msg: {},
-        node: nodeWrapper,
-    };
-    Object.assign(ctx, {
+        node: new NodeWrapper(node, nodeSend, () => {}, {}),
         RED,
         __global: global,
         console,
@@ -200,74 +231,69 @@ async function newCompilation(node: TsNode, comp: Compilation, def: TypeScriptNo
             get: (envVar: any) => RED.util.getSetting(node, envVar)
         },
         setTimeout: (handler: Function, delayMs?: number) => {
-            const id = setTimeout(() => {
-                ctx.clearTimeout(id);
+            const ref = setTimeout(() => {
+                scope.clearTimeout(ref);
                 try {
                     handler();
                 } catch(err) {
                     node.error(err, {});
                 }
             }, delayMs);
-            getTimeouts(node).push(id);
-            return id;
+            node.timeouts.add(ref);
+            return ref;
         },
-        clearTimeout: (id: any) => {
-            clearTimeout(id);
-            const index = getTimeouts(node).indexOf(id);
-            if (index > -1) {
-                getTimeouts(node).splice(index, 1);
-            }
+        clearTimeout: (ref: any) => {
+            clearTimeout(ref);
+            node.timeouts.delete(ref);
         },
         setInterval: (handler: Function, delayMs?: number) => {
-            const id = setInterval(() => {
+            const ref = setInterval(() => {
                 try {
                     handler();
                 } catch(err) {
                     node.error(err,{});
                 }
             }, delayMs);
-            (node as any).outstandingIntervals.push(id);
-            return id;
+            node.intervals.add(ref);
+            return ref;
         },
-        clearInterval: (id: any) => {
-            clearInterval(id);
-            const index = getIntervals(node).indexOf(id);
-            if (index > -1) {
-                getIntervals(node).splice(index, 1);
-            }
+        clearInterval: (ref: any) => {
+            clearInterval(ref);
+            node.intervals.delete(ref);
         },
-    });
+    };
 
     // Inject modules (including default ones defined in HTML)
-    await injectModules(ctx, libs, RED, node);
+    await injectModules(scope, libs, RED, node);
 
     if (!useVm) {
-        const funArgs = Object.keys(ctx);
+        const funArgs = Object.keys(scope);
 
         const fun = new Function(...funArgs, `return ${funJs}`);
         const ini = new Function(...funArgs, `return ${iniJs}`);
         const fin = new Function(...funArgs, `return ${finJs}`);
 
         comp.fun = async (msg, send, done) => {
-            const callCtx = { ...ctx, msg, node: { ...nodeWrapper, send, done } };
-            return fun(...funArgs.map(k => callCtx[k]));
+            scope.msg = msg;
+            scope.node = new NodeWrapper(node, send, done, msg);
+            return fun(...funArgs.map(k => scope[k]));
         }
-        comp.ini = () => ini(...funArgs.map(k => ctx[k]));
-        comp.fin = () => fin(...funArgs.map(k => ctx[k]));
+        comp.ini = () => ini(...funArgs.map(k => scope[k]));
+        comp.fin = () => fin(...funArgs.map(k => scope[k]));
     }
     else {
-        const vmCtx = vm.createContext(ctx);
+        const vmCtx = vm.createContext(scope);
         const vmOptions: vm.RunningScriptOptions = {
             timeout,
             displayErrors: true
         };
-        const funScript = new vm.Script(funJs);
+        const funScript = new vm.Script(`var msg=_msg,node=_node; ${funJs}`);
         const iniScript = new vm.Script(iniJs);
         const finScript = new vm.Script(finJs);
 
         comp.fun = (msg, send, done) => {
-            vmCtx.msg = msg;
-            vmCtx.node = { ...nodeWrapper, send, done };
+            vmCtx._msg = msg;
+            vmCtx._node = new NodeWrapper(node, send, done, msg);
             return funScript.runInContext(vmCtx, vmOptions);
         };
         comp.ini = () => iniScript.runInContext(vmCtx, vmOptions);
@@ -312,6 +338,8 @@ async function getCompilation(node: TsNode, def: TypeScriptNodeDef, RED: any): P
 
 interface TsNode extends Node {
     comp: Compilation | undefined;
+    timeouts: Set<any>;
+    intervals: Set<any>;
 }
 
 export = (RED: NodeAPI) => {
@@ -320,11 +348,14 @@ export = (RED: NodeAPI) => {
 
         // Precompile on node creation
         getCompilation(this, def, RED);
+
+        this.timeouts = new Set<any>();
+        this.intervals = new Set<any>();
         
         this.on('input', async (msg: any, send: any, done: (err?: any) => void) => {
             const comp = await getCompilation(this, def, RED);
             if (!comp) { done(); return; }
-
+            
             let doneCalled = false;
             const safeDone = (err?: any) => {
                 if (!doneCalled) { doneCalled = true; done(err); }
@@ -332,7 +363,7 @@ export = (RED: NodeAPI) => {
 
             try {
                 const outputs = await comp.fun(msg, send, safeDone);
-                send(outputs);
+                sendResults(send, msg._msgid, outputs);
                 safeDone();
             } catch (error: any) {
                 safeDone(error);
@@ -347,17 +378,29 @@ export = (RED: NodeAPI) => {
                 this.error('Error in function finalize: ' + (error.stack || error.message));
             }
 
-            const timeouts = getTimeouts(this);
-            timeouts.forEach(clearTimeout);
-            timeouts.length = 0;
+            if ((this as any).clearStatus) this.status({});
 
-            const intervals = getIntervals(this);
-            intervals.forEach(clearInterval);
-            intervals.length = 0;
+            this.timeouts.forEach(clearTimeout);
+            this.timeouts.clear();
+
+            this.intervals.forEach(clearInterval);
+            this.intervals.clear();
 
             delete this.comp;
         });
     };
     
-    (RED.nodes.registerType as any)("typescript", TypeScriptNode, { dynamicModuleList: "libs" });
+    (RED.nodes.registerType as any)("typescript", TypeScriptNode, {
+        dynamicModuleList: "libs",
+        settings: {
+            functionExternalModules: {
+                value: true,
+                exportable: true
+            },
+            functionTimeout: {
+                value:0,
+                exportable: true
+            }
+        }
+    });
 };
