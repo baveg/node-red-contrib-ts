@@ -103,7 +103,6 @@ function configMonaco(editor: any, customDeclare: any, nodeLibs?: any[]) {
 /// <reference types="node" />
 
 declare const require: NodeRequire;
-declare const util: typeof import('util');
 
 ${generateModuleDeclarations(nodeLibs)}
 
@@ -293,13 +292,11 @@ const getModuleVarName = (v: string) => {
 }
 
 var invalidModuleVNames = [
-    "console",
-    "util",
-    "Buffer",
-    "Date",
-    "RED",
+    "msg",
     "node",
-    "__node__",
+    "RED",
+    "__global",
+    "require",
     "context",
     "flow",
     "global",
@@ -308,7 +305,11 @@ var invalidModuleVNames = [
     "clearTimeout",
     "setInterval",
     "clearInterval",
-    "promisify",
+    "console",
+    "Buffer",
+    "URL",
+    "URLSearchParams",
+    "fetch",
 ];
 
 // Simplification : on log juste les erreurs de modules manquants dans la console
