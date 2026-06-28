@@ -40,6 +40,7 @@ class NodeWrapper {
         private _msgid: string,
     ) {}
 
+    get RED() { return this._node.RED; }
     get id() { return this._node.id; }
     get name() { return this._node.name; }
     get path() { return this._node._path; }
@@ -57,7 +58,13 @@ class NodeWrapper {
         return this._node.status(...args);
     }
 
-    on(...args: any[]) { return (this._node as any).on(...args); }
+    on(...args: any[]) {
+        if (args[0] === "input") {
+            const RED = this._node.RED;
+            throw new Error(RED._("function.error.inputListener"));
+        }
+        return (this._node as any).on(...args);
+    }
 
     send(msg: Msg | Msg[]) {
         sendResults(this._send, this._msgid, msg);
@@ -356,6 +363,7 @@ async function getCompilation(node: TsNode, def: TypeScriptNodeDef, RED: any): P
 }
 
 interface TsNode extends Node {
+    RED: NodeAPI;
     comp: Compilation | undefined;
     timeouts: Set<any>;
     intervals: Set<any>;
@@ -374,6 +382,8 @@ interface TsNode extends Node {
 export = (RED: NodeAPI) => {
     const TypeScriptNode = function(this: TsNode, def: TypeScriptNodeDef) {
         RED.nodes.createNode(this, def);
+
+        this.RED = RED;
 
         // Precompile on node creation
         getCompilation(this, def, RED);
